@@ -1,0 +1,74 @@
+name: kora
+
+services:
+  kora:
+    image: ghcr.io/kofm/kora:${KORA_VERSION:-latest}
+    command: >-
+      uv run --no-dev gunicorn persefone.wsgi:application
+      --bind 0.0.0.0:${GUNICORN_PORT:-8000}
+      --workers ${GUNICORN_WORKERS:-1}
+    volumes:
+      - static_files:/var/www/static
+      - docs:/var/www/docs
+    env_file: .env
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - >-
+          import urllib.request;
+          urllib.request.urlopen('http://localhost:${GUNICORN_PORT:-8000}/ready/', timeout=5)
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+
+  db:
+    image: postgres:18.1-alpine
+    shm_size: 128mb
+    environment:
+      POSTGRES_USER: ${DB_USER:?SET DB_USER IN .ENV}
+      POSTGRES_DB: ${DB_NAME:?SET DB_NAME IN .ENV}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:?SET DB_PASSWORD IN .ENV}
+    volumes:
+      - db_volume:/var/lib/postgresql
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+
+  nginx:
+    image: nginx:1.29-alpine
+    volumes:
+      - static_files:/var/www/static:ro
+      - docs:/var/www/docs:ro
+      - ./templates:/etc/nginx/templates:ro
+    ports:
+      - "127.0.0.1:${NGINX_PORT:-8000}:80"
+    environment:
+      NGINX_HOST: ${NGINX_HOST:-localhost}
+      NGINX_SERVER_NAME: ${NGINX_SERVER_NAME:-_}
+      GUNICORN_PORT: ${GUNICORN_PORT:-8000}
+    depends_on:
+      kora:
+        condition: service_healthy
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "wget --quiet --spider --header=Host:$${NGINX_HOST} http://127.0.0.1/ready/ || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+
+volumes:
+  db_volume:
+  static_files:
+  docs:

@@ -1,0 +1,435 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+IFS=$'\n\t'
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+ENV_FILE="$SCRIPT_DIR/.env"
+ENV_TEMPLATE="$SCRIPT_DIR/env.example"
+KORA_IMAGE="ghcr.io/kofm/kora:${KORA_VERSION:-latest}"
+INSECURE_DB_PASSWORD='kora_changeme_insecure'
+INSECURE_SECRET_KEY='kora_insecure_u&(t17%=gm5$kg#1mm562q#3(8mrrlb0!2bg75(z5k(!62l+bf'
+SETUP_TMP_FILE=""
+
+cd "$SCRIPT_DIR"
+
+if docker compose version &>/dev/null; then
+    DC=(docker compose)
+elif command -v docker-compose &>/dev/null; then
+    DC=(docker-compose)
+else
+    printf "Docker Compose not available.\n" >&2
+    exit 127
+fi
+
+compose() {
+    "${DC[@]}" "$@"
+}
+
+show_menu() {
+    clear
+    cat << 'EOF'
+
+
+ _                   
+| | _____  _ __ __ _ 
+| |/ / _ \| '__/ _` |
+|   < (_) | | | (_| |
+|_|\_\___/|_|  \__,_|
+EOF
+    
+    echo ""
+    date
+    echo ""
+    echo "Select one of the available options:"
+    echo ""
+    echo "0. Start Kora"
+    echo "1. Stop Kora"
+    echo "2. Update Kora"
+    echo "3. Backup data"
+    echo "4. Restore backup"
+    echo "5. Create admin user"
+    echo "q. Quit"
+    echo ""
+}
+
+read_choice() {
+    read -n 1 -s -p "[0-5] or q: " choice
+    echo
+}
+
+echo_error() {
+    echo -e "\e[31mERROR\e[0m: $1"
+}
+
+load_database_config() {
+    if [[ ! -f "$ENV_FILE" ]]; then
+        echo_error "There is no .env file!"
+        return 1
+    fi
+
+    # The project configuration is a shell-compatible dotenv file.
+    # shellcheck disable=SC1090
+    source "$ENV_FILE"
+
+    if [[ -z "${DB_PASSWORD:-}" || -z "${DB_USER:-}" || -z "${DB_NAME:-}" ]]; then
+        echo_error "DB_PASSWORD, DB_USER, and DB_NAME must be set in .env."
+        return 1
+    fi
+}
+
+warn_insecure_configuration() {
+    if grep -Fqx -- "DB_PASSWORD=$INSECURE_DB_PASSWORD" "$ENV_FILE"; then
+        echo_error "WARNING: .env still uses the insecure example database password."
+        insecure=true
+    fi
+
+    if grep -Fqx -- "SECRET_KEY='$INSECURE_SECRET_KEY'" "$ENV_FILE" ||
+       grep -Fqx -- "SECRET_KEY=$INSECURE_SECRET_KEY" "$ENV_FILE"; then
+        echo_error "WARNING: .env still uses the insecure example SECRET_KEY."
+    fi
+}
+
+cleanup_setup_file() {
+    if [[ -n "${SETUP_TMP_FILE:-}" ]]; then
+        rm -f -- "$SETUP_TMP_FILE"
+    fi
+}
+
+generate_env() {
+    local previous_umask
+
+    if [[ ! -f "$ENV_TEMPLATE" ]]; then
+        echo_error "Configuration template not found: $ENV_TEMPLATE"
+        return 1
+    fi
+
+    previous_umask="$(umask)"
+    umask 077
+    if ! SETUP_TMP_FILE="$(mktemp "$ENV_FILE.tmp.XXXXXX")"; then
+        umask "$previous_umask"
+        echo_error "Could not create a temporary configuration file."
+        return 1
+    fi
+    umask "$previous_umask"
+    trap 'cleanup_setup_file; exit 130' HUP INT TERM
+
+    echo "Generating secure database and application secrets..."
+    if ! docker run --rm -i \
+        --entrypoint python \
+        "$KORA_IMAGE" \
+        -c '
+import re
+import secrets
+import sys
+
+content = sys.stdin.read()
+values = {
+    "DB_PASSWORD": secrets.token_urlsafe(32),
+    "SECRET_KEY": secrets.token_urlsafe(48),
+}
+
+for name, value in values.items():
+    content, count = re.subn(rf"(?m)^{name}=.*$", f"{name}={value}", content)
+    if count != 1:
+        raise SystemExit(f"Expected exactly one {name} entry, found {count}")
+
+sys.stdout.write(content)
+' < "$ENV_TEMPLATE" > "$SETUP_TMP_FILE"; then
+        echo_error "Could not generate .env using $KORA_IMAGE."
+        cleanup_setup_file
+        SETUP_TMP_FILE=""
+        trap - HUP INT TERM
+        return 1
+    fi
+
+    if [[ ! -s "$SETUP_TMP_FILE" ]]; then
+        echo_error "Generated configuration is empty."
+        cleanup_setup_file
+        SETUP_TMP_FILE=""
+        trap - HUP INT TERM
+        return 1
+    fi
+
+    if ! mv -- "$SETUP_TMP_FILE" "$ENV_FILE"; then
+        echo_error "Could not install the generated .env file."
+        cleanup_setup_file
+        SETUP_TMP_FILE=""
+        trap - HUP INT TERM
+        return 1
+    fi
+
+    SETUP_TMP_FILE=""
+    trap - HUP INT TERM
+    echo "Created .env with secure random credentials."
+}
+
+ensure_env() {
+    if [[ -f "$ENV_FILE" ]]; then
+        warn_insecure_configuration
+    else
+        generate_env
+    fi
+}
+
+backup_db() {
+    local output_filename="kora_db_bk_$(date '+%Y-%m-%d-%H%M%S').backup"
+    local temporary_filename
+
+    load_database_config || return 1
+
+    if ! temporary_filename="$(mktemp "${output_filename}.tmp.XXXXXX")"; then
+        echo_error "Could not create a temporary backup file."
+        return 1
+    fi
+    trap 'rm -f -- "$temporary_filename"; exit 130' HUP INT TERM
+
+    echo "Dumping DB..."
+    if ! compose exec -T -e "PGPASSWORD=$DB_PASSWORD" db \
+        pg_dump -Fc -U "$DB_USER" "$DB_NAME" > "$temporary_filename"; then
+        rm -f -- "$temporary_filename"
+        trap - HUP INT TERM
+        echo_error "Couldn't backup the database. Are you sure Docker is running?"
+        return 1
+    fi
+
+    if ! mv -- "$temporary_filename" "$output_filename"; then
+        rm -f -- "$temporary_filename"
+        trap - HUP INT TERM
+        echo_error "Could not save the database backup."
+        return 1
+    fi
+
+    trap - HUP INT TERM
+    echo "Done. Database backup stored in file $output_filename"
+}
+
+restore_db() {
+    local -a file_list=()
+    local file datetime backup_date backup_time selection selection_number selected_file answer
+    local backup_pattern='^kora_db_bk_[0-9]{4}-[0-9]{2}-[0-9]{2}-[0-9]{6}\.backup$'
+    local i
+
+    clear 2>/dev/null || true
+
+    shopt -s nullglob
+    for file in kora_db_bk_*.backup; do
+        if [[ -f "$file" && "$file" =~ $backup_pattern ]]; then
+            file_list+=("$file")
+        fi
+    done
+    shopt -u nullglob
+
+    if (( ${#file_list[@]} == 0 )); then
+        echo_error "There are no backup files in the current directory"
+        return 1
+    fi
+
+    echo "Available backups:"
+    echo ""
+
+    for i in "${!file_list[@]}"; do
+        file="${file_list[$i]}"
+        datetime="${file#kora_db_bk_}"
+        datetime="${datetime%.backup}"
+        backup_date="${datetime:0:10}"
+        backup_time="${datetime:11:6}"
+        printf '%d. %s %s:%s:%s\n' \
+            "$((i + 1))" "$backup_date" \
+            "${backup_time:0:2}" "${backup_time:2:2}" "${backup_time:4:2}"
+    done
+
+    echo ""
+    echo "Enter the number of the backup you wish to select [1-${#file_list[@]}] or q to exit:"
+    read -r selection
+
+    if [[ "$selection" == "q" ]]; then
+        return 0
+    fi
+
+    if ! [[ "$selection" =~ ^[0-9]+$ ]]; then
+        echo_error "Invalid selection. Please enter a number between 1 and ${#file_list[@]}."
+        return 1
+    fi
+
+    selection_number=$((10#$selection))
+    if (( selection_number < 1 || selection_number > ${#file_list[@]} )); then
+        echo_error "Invalid selection. Please enter a number between 1 and ${#file_list[@]}."
+        return 1
+    fi
+
+    selected_file="${file_list[$((selection_number - 1))]}"
+
+    if [[ ! -f "$selected_file" ]]; then
+        echo_error "The selected backup file no longer exists."
+        return 1
+    fi
+
+    if [[ ! -s "$selected_file" ]]; then
+        echo_error "The selected backup file is empty."
+        return 1
+    fi
+
+    load_database_config || return 1
+
+    clear 2>/dev/null || true
+
+    echo ""
+    echo -e "\e[31m### WARNING ###\e[0m"
+    echo ""
+    echo -e "This restore is destructive and will \e[31mreplace your current database data\e[0m."
+    echo "Only restore backup files from a trusted source."
+    echo ""
+    echo -e "If you \e[31mREALLY UNDERSTAND\e[0m what you're doing, \e[36mwrite 'yes' to continue\e[0m"
+    echo ""
+    echo -e "You selected: \e[36m$selected_file\e[0m"
+
+    read -r answer
+
+    if [[ "$answer" != "yes" && "$answer" != "YES" ]]; then
+        echo "Exiting."
+        return 0
+    fi
+
+    echo "Restoring database..."
+    if ! compose exec -T -e "PGPASSWORD=$DB_PASSWORD" db \
+        pg_restore --clean --if-exists --exit-on-error \
+        -U "$DB_USER" -d "$DB_NAME" < "$selected_file"; then
+        echo_error "Could not restore database from $selected_file. The database may be partially restored."
+        return 1
+    fi
+
+    echo ""
+    echo -e "\e[31mDone. Database restored from $selected_file\e[0m"
+}
+
+start_kora() {
+    local offer_onboarding_superuser="${1:-true}"
+    local needs_onboarding=false
+
+    if [[ ! -f "$ENV_FILE" ]]; then
+        needs_onboarding=true
+    fi
+
+    ensure_env || return 1
+    compose up -d
+
+    if [[ "$needs_onboarding" == true && "$offer_onboarding_superuser" == true ]]; then
+        offer_initial_superuser
+    fi
+}
+
+stop_kora() {
+    compose down
+}
+
+update_kora() {
+    backup_db || return 1
+
+    echo "Pulling the latest published images..."
+    if ! compose pull; then
+        echo_error "Kora images could not be pulled. The existing installation was not changed."
+        return 1
+    fi
+
+    echo "Restarting Kora..."
+    if ! compose up -d; then
+        echo_error "Kora could not be restarted."
+        return 1
+    fi
+
+    echo "Current service status:"
+    if ! compose ps; then
+        echo_error "Kora was restarted, but its service status could not be read."
+        return 1
+    fi
+}
+
+run_createsuperuser() {
+    compose exec kora uv run --no-dev manage.py createsuperuser
+}
+
+offer_initial_superuser() {
+    local answer
+
+    echo ""
+    while true; do
+        if ! read -r -p "Create a superuser now? [Y/n] " answer; then
+            echo ""
+            echo "Skipping superuser creation. You can create one later with ./ko createsuperuser"
+            return 0
+        fi
+
+        case "$answer" in
+            ""|[Yy]|[Yy][Ee][Ss])
+                if ! run_createsuperuser; then
+                    echo_error "Superuser creation did not complete."
+                    echo "You can try again later with ./ko createsuperuser"
+                fi
+                return 0
+                ;;
+            [Nn]|[Nn][Oo])
+                echo "You can create a superuser later with ./ko createsuperuser"
+                return 0
+                ;;
+            *)
+                echo "Please answer y or n."
+                ;;
+        esac
+    done
+}
+
+create_superuser() {
+    start_kora false || return 1
+    run_createsuperuser
+}
+
+usage() {
+    cat <<EOF
+Usage: ./ko [start|stop|backup|restore|update|createsuperuser]
+
+Run without an argument to open the interactive menu.
+EOF
+}
+
+if [[ $# -gt 0 ]]; then
+    if [[ $# -ne 1 ]]; then
+        usage >&2
+        exit 2
+    fi
+
+    case "$1" in
+        start) start_kora ;;
+        stop) stop_kora ;;
+        backup) backup_db ;;
+        restore) restore_db ;;
+        update) update_kora ;;
+        createsuperuser) create_superuser ;;
+        -h|--help) usage ;;
+        *)
+            echo_error "Unknown command: $1"
+            usage >&2
+            exit 2
+            ;;
+    esac
+    exit 0
+fi
+
+while true; do
+    show_menu
+    read_choice
+
+    case $choice in
+        0) start_kora ;;
+        1) stop_kora ;;
+        2) update_kora ;;
+        3) backup_db ;;
+        4) restore_db ;;
+        5) create_superuser ;;
+        q) echo "Exiting." && break ;;
+        *) echo "Invalid option, please try again." ;;
+    esac
+
+    echo "Press any key to continue..."
+    read -n 1 -s
+done

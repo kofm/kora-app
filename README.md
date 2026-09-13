@@ -87,3 +87,9 @@ The update command create a backup, updates kora, and then restarts it.
 ## Documentation
 
 Check out documentation at https://docs.getkora.org
+
+## License
+
+Copyright (C) 2026 Gabriele Mongiano.
+
+Kora is free software licensed under the GNU Affero General Public License version 3 or later (AGPL-3.0-or-later). See [LICENSE](LICENSE) for details.
